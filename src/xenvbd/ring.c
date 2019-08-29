@@ -1086,7 +1086,8 @@ __BlkifRingInsertRequest(
 
 static FORCEINLINE NTSTATUS
 __BlkifRingPostRequests(
-    IN  PXENVBD_BLKIF_RING  BlkifRing
+    IN  PXENVBD_BLKIF_RING  BlkifRing,
+    OUT BOOLEAN             Pushed
     )
 {
 #define RING_SLOTS_AVAILABLE(_Front, _req_prod, _rsp_cons)   \
@@ -1131,6 +1132,16 @@ __BlkifRingPostRequests(
                                  req);
 
         InsertTailList(&BlkifRing->SubmittedList, ListEntry);
+
+        if (!*Pushed) {
+            /* Wake a polling backend early as soon as we have anything,
+             * but only once at the beginning of a batch.
+             * Backend also gets woken up every ring/4 batches by the caller */
+            BlkifRing->Front.req_prod_pvt = req_prod;
+            KeMemoryBarrier();
+            __BlkifRingPushRequests(BlkifRing);
+            *Pushed = TRUE;
+        }
 
         if (RING_SLOTS_AVAILABLE(&BlkifRing->Front, req_prod, rsp_cons) <= 1)
             break;
@@ -1248,9 +1259,10 @@ BlkifRingPoll(
 
     PXENVBD_RING            Ring;
     BOOLEAN                 Retry;
+    BOOLEAN                 Updated;
 
     Ring = BlkifRing->Ring;
-    Retry = FALSE;
+    Retry = Updated = FALSE;
 
     if (!BlkifRing->Enabled)
         goto done;
@@ -1287,8 +1299,17 @@ BlkifRingPoll(
                                         Request,
                                         rsp->status);
 
-            if (rsp_cons - BlkifRing->Front.rsp_cons > XENVBD_BATCH(BlkifRing))
+            if (rsp_cons - BlkifRing->Front.rsp_cons > XENVBD_BATCH(BlkifRing)) {
                 Retry = TRUE;
+            } else if (!Updated) {
+                /* Wake polling backend as soon as we processed anything,
+                 * but only once */
+                KeMemoryBarrier();
+
+                BlkifRing->Front.rsp_cons = rsp_cons;
+
+                Updated = TRUE;
+            }
         }
 
         KeMemoryBarrier();
@@ -1398,12 +1419,13 @@ BlkifRingSchedule(
 {
     PXENVBD_SRB_STATE       State;
     BOOLEAN                 Polled;
+    BOOLEAN                 Pushed;
 
     if (!BlkifRing->Enabled)
         return;
 
     State = &BlkifRing->State;
-    Polled = FALSE;
+    Polled = Pushed = FALSE;
 
     while (!BlkifRing->Stopped) {
         PLIST_ENTRY         ListEntry;
@@ -1411,7 +1433,7 @@ BlkifRingSchedule(
         NTSTATUS            status;
 
         if (State->Count != 0) {
-            status = __BlkifRingPostRequests(BlkifRing);
+            status = __BlkifRingPostRequests(BlkifRing, &Pushed);
             if (!NT_SUCCESS(status))
                 BlkifRing->Stopped = TRUE;
         }
@@ -1426,8 +1448,10 @@ BlkifRingSchedule(
         }
 
         if (BlkifRing->RequestsPosted - BlkifRing->RequestsPushed >=
-            RING_SIZE(&BlkifRing->Front) / 4)
+            RING_SIZE(&BlkifRing->Front) / 4) {
             __BlkifRingPushRequests(BlkifRing);
+            Pushed = TRUE;
+        }
 
         if (IsListEmpty(&BlkifRing->SrbQueue))
             break;
